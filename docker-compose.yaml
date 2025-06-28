@@ -1,0 +1,299 @@
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow_dockerfile
+    dockerfile: Dockerfile
+  user: "${AIRFLOW_UID}:${AIRFLOW_GID}"
+  env_file:
+    - .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 5
+    _AIRFLOW_DB_MIGRATE: 'true'
+    _AIRFLOW_WWW_USER_CREATE: 'true'
+    _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+    _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+  volumes:
+    - ./data_lake:/opt/data_lake
+    - ./data_lake/monitoring:/opt/data_lake/monitoring
+    - ./synthetic_data:/opt/synthetic_data
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts
+    - ./dbt_click:/opt/dbt_click
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - all_in_one
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - "5432:5432"
+    restart: always
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./src/init_db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-U", "airflow" ]
+      interval: 5s
+      retries: 5
+    networks:
+      - all_in_one
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - all_in_one
+
+  clickhouse:
+    image: yandex/clickhouse-server:latest
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./clickhouse:/var/lib/clickhouse
+      - ./data_lake:/opt/data_lake
+      - ./docker_related_config.xml:/etc/clickhouse-server/config.d/docker_related_config.xml
+      - ./clickhouse/init:/docker-entrypoint-initdb.d
+    networks:
+      - all_in_one
+
+  af-webserver:
+    <<: *airflow-common
+    container_name: af-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+
+  af-scheduler:
+    <<: *airflow-common
+    container_name: af-scheduler
+    command: scheduler
+    restart: always
+
+  af-worker:
+    <<: *airflow-common
+    container_name: af-worker
+    command: celery worker
+    ports:
+      - "4041:4041"
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command:
+      - bash
+      - -c
+      - |
+          echo "Airflow version"
+          airflow version
+          airflow connections add 'spark_default' \
+            --conn-type 'spark' \
+            --conn-host 'local' \
+            --conn-extra '{"spark-binary": "spark-submit", "deploy-mode": "client"}'
+
+          airflow connections add 'backend_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres' \
+            --conn-login "${POSTGRES_USER}" \
+            --conn-password "${POSTGRES_PASSWORD}" \
+            --conn-schema 'backend' \
+            --conn-port 5432
+        
+          airflow connections add 'metadata_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres' \
+            --conn-login "${POSTGRES_USER}" \
+            --conn-password "${POSTGRES_PASSWORD}" \
+            --conn-schema 'metadata' \
+            --conn-port 5432
+        
+          airflow connections add 'minios3_conn' \
+            --conn-type 'aws' \
+            --conn-login "${MINIO_ROOT_USER}" \
+            --conn-password "${MINIO_ROOT_PASSWORD}" \
+            --conn-extra '{"endpoint_url": "http://minio:9000"}'
+
+  jupyter:
+    container_name: jupyter_notebook
+    build:
+      context: ./jupyter_dockerfile
+      dockerfile: Dockerfile
+    ports:
+      - "10000:8888"
+      - "4040:4040"
+    volumes:
+      - ./synthetic_data:/home/jovyan/source
+      - ./data_lake:/home/jovyan/data_lake
+      - ./jupyter_notebook:/home/jovyan
+    command: jupyter notebook --no-browser --NotebookApp.token='' --NotebookApp.password='' --ip='*' --allow-root
+    environment:
+      GRANT_SUDO: yes
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    user: root
+    restart: always
+    networks:
+      - all_in_one
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - '2181:2181'
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: echo srvr | nc zookeeper 2181 || exit 1
+      start_period: 10s
+      retries: 20
+      interval: 10s
+    networks:
+      all_in_one:
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - '29093:29092'
+      - '9093:9092'
+      - '9094:9101'
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29093,PLAINTEXT_HOST://localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_JMX_PORT: 9094
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:
+      test: nc -z localhost 9093 || exit -1
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    networks:
+      all_in_one:
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8082:8080"
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29093
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+    networks:
+      all_in_one:
+
+  kafka-connect:
+      build:
+        context: ./debezium-jmx-exporter
+        args:
+          JMX_AGENT_VERSION: 0.15.0
+      container_name: kafka-connect
+      restart: unless-stopped
+      ports:
+        - "8083:8083"
+        - "1976:1976"
+      depends_on:
+        kafka:
+          condition: service_healthy
+      environment:
+        BOOTSTRAP_SERVERS: kafka:29093
+        GROUP_ID: 1
+        CONFIG_STORAGE_TOPIC: kafka_connect_configs
+        OFFSET_STORAGE_TOPIC: kafka_connect_offsets
+        STATUS_STORAGE_TOPIC: kafka_connect_statuses
+        KAFKA_OPTS: -javaagent:/kafka/etc/jmx_prometheus_javaagent.jar=8080:/kafka/etc/config.yml
+        JMXHOST: localhost
+        JMXPORT: 1976
+      healthcheck:
+            test: [ "CMD-SHELL", "curl -sSf http://localhost:8083/connectors || exit 1" ]
+            interval: 10s
+            timeout: 5s
+            retries: 10
+      networks:
+        all_in_one:
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9001:9001"  # UI
+      - "9002:9000"  # API
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - ./s3_storage:/data
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/ready" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - all_in_one
+
+  create-bucket:
+    image: minio/mc
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+        echo 'Waiting for MinIO...';
+        sleep 5;
+      done;
+      
+      mc mb -p local/${MINIO_PROD_BUCKET_NAME} || true;
+      mc policy set public local/${MINIO_PROD_BUCKET_NAME} || true;
+      
+      mc mb -p local/${MINIO_DEV_BUCKET_NAME} || true;
+      mc policy set public local/${MINIO_DEV_BUCKET_NAME} || true;
+      "
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - all_in_one
+
+volumes:
+  postgres-db-volume:
+  clickhouse:
+
+networks:
+  all_in_one:
+    driver: bridge

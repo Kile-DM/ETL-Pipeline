@@ -1,0 +1,8 @@
+airflow-providers-clickhouse==0.0.1
+apache-airflow-providers-apache-spark==4.11.1
+apache-airflow-providers-apache-kafka==1.9.0
+pandas
+requests==2.31.0
+pyspark
+faker
+psycopg2-binary

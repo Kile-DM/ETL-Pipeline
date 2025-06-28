@@ -1,0 +1,41 @@
+### Update connector
+PUT http://localhost:8083/connectors/backend/config
+Content-Type: application/json
+
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "plugin.name": "pgoutput",
+
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "airflow",
+  "database.password": "airflow",
+  "database.dbname": "backend",
+  "database.server.name": "postgres",
+
+  "slot.name": "order_events_slot",
+  "publication.name": "backend_publication",
+  "publication.autocreate.mode": "filtered",
+
+  "table.include.list": "public.dbz_signal,public.dbz_heartbeat,public.order_events",
+  "snapshot.mode": "no_data",
+
+  "signal.enabled.channels": "source,kafka",
+  "signal.data.collection": "public.dbz_signal",
+  "signal.kafka.bootstrap.servers": "kafka:29092",
+  "signal.kafka.topic": "backend.signal",
+
+  "heartbeat.interval.ms": "10000",
+  "heartbeat.action.query": "INSERT INTO public.dbz_heartbeat (id, ts) VALUES (1, NOW()) ON CONFLICT(id) DO UPDATE SET ts=EXCLUDED.ts;",
+
+  "topic.prefix": "backend",
+  "tombstones.on.delete": "false",
+
+  "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "key.converter.schemas.enable": "false",
+
+  "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "value.converter.schemas.enable": "false",
+
+  "include.before.state": "true"
+}
